@@ -95,11 +95,11 @@ Text like a real person in chat: contractions, occasional tangents ("sorry, Kare
 
 ## 3. Tools used
 
-**Model:** Claude (Sonnet class; `claude-sonnet-4-5` in the orchestrator, overridable via `COURSE_MODEL`) — one model plays both characters, each with its own system prompt and its own message history, so neither persona sees the other's instructions.
+**Model:** any OpenAI-compatible chat model; the runner defaults to a free Qwen model on OpenRouter's free tier (`COURSE_MODEL`, `COURSE_BASE_URL` env vars — Groq and local Ollama configs included in `.env.example`). One model plays both characters, each with its own system prompt and its own message history, so neither persona sees the other's instructions. (The reference transcript in §4 was produced with Claude playing both roles via the same turn-by-turn procedure.)
 
-**Memory tool (`update_memory`, `src/memory.py`):** the mentor records a per-lesson verdict (`unverified` / `shaky` / `verified` / `caught-bluffing`) plus free-text notes after each turn; the state is re-injected into the mentor's system context every turn so verdicts survive a long dialogue. Crucially, the tool *refuses* `advance_to_lesson` unless the previous lesson is `verified` — the assignment's core rule is enforced in code, not just in prose.
+**Memory tool (`src/memory.py`):** the mentor ends every message with a `<memory>{...}</memory>` JSON block recording a per-lesson verdict (`unverified` / `shaky` / `verified` / `caught-bluffing`) plus free-text notes; the accumulated state is re-injected into the mentor's system context every turn so verdicts survive a long dialogue. Crucially, the orchestrator *refuses* `advance_to_lesson` unless the previous lesson is `verified` — the assignment's core rule is enforced in code, not just in prose. A text protocol (rather than native function calling) was chosen deliberately so the same code runs on free-tier models, where tool-call support is inconsistent.
 
-**Orchestrator (`src/orchestrator.py`):** a plain turn-by-turn loop (mentor → student → mentor…) with transcript capture to markdown and JSONL, a turn-budget safety valve, and a `[COURSE_COMPLETE]` end marker emitted by the mentor after the final assessment.
+**Orchestrator (`src/orchestrator.py`):** a plain turn-by-turn loop (mentor → student → mentor…) that strips the memory block before the student sees anything, feeds refused/malformed memory updates back to the mentor as corrective system notes, captures the transcript to markdown and JSONL, throttles calls for free-tier rate limits, and stops on a `[COURSE_COMPLETE]` marker emitted by the mentor after the final assessment (with a turn-budget safety valve).
 
 **Curriculum as data (`course/curriculum.json`):** each lesson carries its verification questions and red flags, written *before* the lesson content (per the assignment tip), and is injected into the mentor's system prompt.
 

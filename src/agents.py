@@ -1,9 +1,12 @@
-"""Two-agent wrappers around the Anthropic Messages API.
+"""Two-agent wrappers over any OpenAI-compatible chat API.
+
+Works with free/cheap providers out of the box:
+- OpenRouter (default): free-tier models like Qwen ':free' variants
+- Groq: fast free tier (e.g. llama / qwen models)
+- Ollama: fully free, local (base url http://localhost:11434/v1)
 
 Each agent keeps its OWN message history in which *it* is the assistant and
-the other agent is the user. That is the cleanest way to run a symmetric
-dialogue: from the mentor's point of view the student is 'user', and vice
-versa.
+the other agent is the user — the cleanest way to run a symmetric dialogue.
 """
 
 from __future__ import annotations
@@ -11,66 +14,68 @@ from __future__ import annotations
 import os
 import time
 
-import anthropic
+from openai import OpenAI, APIStatusError, RateLimitError
 
-MODEL = os.environ.get("COURSE_MODEL", "claude-sonnet-4-5")
-MAX_TOKENS = 1200
+BASE_URL = os.environ.get("COURSE_BASE_URL", "https://openrouter.ai/api/v1")
+API_KEY = (
+    os.environ.get("COURSE_API_KEY")
+    or os.environ.get("OPENROUTER_API_KEY")
+    or os.environ.get("OPENAI_API_KEY")
+    or "ollama"  # Ollama ignores the key; anything non-empty works
+)
+MODEL = os.environ.get("COURSE_MODEL", "qwen/qwen3-14b:free")
+MAX_TOKENS = int(os.environ.get("COURSE_MAX_TOKENS", "1200"))
+# Free tiers are rate-limited (OpenRouter free: ~20 req/min). Pause between calls.
+SLEEP_BETWEEN_CALLS = float(os.environ.get("COURSE_SLEEP", "3.5"))
 
 
 class Agent:
-    def __init__(self, name: str, system_prompt: str, tools: list | None = None):
+    def __init__(self, name: str, system_prompt: str):
         self.name = name
         self.system_prompt = system_prompt
-        self.tools = tools or []
         self.history: list[dict] = []  # this agent's own view of the dialogue
-        self.client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY
+        self.client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
 
     def hear(self, text: str) -> None:
         """Record a message from the other agent (as 'user' in this agent's view)."""
         self.history.append({"role": "user", "content": text})
 
-    def _call(self, messages: list[dict], system: str) -> anthropic.types.Message:
-        for attempt in range(4):
-            try:
-                return self.client.messages.create(
-                    model=MODEL,
-                    max_tokens=MAX_TOKENS,
-                    system=system,
-                    messages=messages,
-                    tools=self.tools if self.tools else anthropic.NOT_GIVEN,
-                )
-            except anthropic.APIStatusError as e:
-                if e.status_code in (429, 529) and attempt < 3:
-                    time.sleep(2**attempt * 2)
-                    continue
-                raise
-        raise RuntimeError("unreachable")
-
-    def speak(self, memory_block: str | None = None, tool_handler=None) -> str:
-        """Produce this agent's next turn. If the model calls tools,
-        tool_handler(name, args) -> str resolves them, looping until text."""
+    def speak(self, memory_block: str | None = None) -> str:
+        """Produce this agent's next turn."""
         system = self.system_prompt
         if memory_block:
             # Memory goes into system context each turn so it never scrolls away.
             system = f"{self.system_prompt}\n\n{memory_block}"
 
-        messages = list(self.history)
-        while True:
-            response = self._call(messages, system)
-            text_parts = [b.text for b in response.content if b.type == "text"]
-            tool_uses = [b for b in response.content if b.type == "tool_use"]
+        messages = [{"role": "system", "content": system}] + self.history
 
-            if not tool_uses:
-                text = "\n".join(text_parts).strip()
-                self.history.append({"role": "assistant", "content": text})
-                return text
-
-            # Resolve tool calls, then continue the same turn.
-            messages.append({"role": "assistant", "content": response.content})
-            results = []
-            for tu in tool_uses:
-                result = tool_handler(tu.name, tu.input) if tool_handler else "ok"
-                results.append(
-                    {"type": "tool_result", "tool_use_id": tu.id, "content": result}
+        text = ""
+        for attempt in range(6):
+            try:
+                time.sleep(SLEEP_BETWEEN_CALLS)
+                response = self.client.chat.completions.create(
+                    model=MODEL,
+                    max_tokens=MAX_TOKENS,
+                    messages=messages,
                 )
-            messages.append({"role": "user", "content": results})
+                text = (response.choices[0].message.content or "").strip()
+                # Some free reasoning models emit <think>...</think>; strip it.
+                if "<think>" in text and "</think>" in text:
+                    text = text.split("</think>", 1)[1].strip()
+                if text:
+                    break
+                # Empty completion: retry (happens on flaky free endpoints).
+            except RateLimitError:
+                wait = 2**attempt * 5
+                print(f"[{self.name}] rate limited, waiting {wait}s...")
+                time.sleep(wait)
+            except APIStatusError as e:
+                if e.status_code in (429, 500, 502, 503, 529) and attempt < 5:
+                    time.sleep(2**attempt * 5)
+                    continue
+                raise
+        if not text:
+            raise RuntimeError(f"{self.name}: no completion after retries (model={MODEL})")
+
+        self.history.append({"role": "assistant", "content": text})
+        return text

@@ -1,7 +1,8 @@
 """Entry point: python -m src.run_course
 
-Requires ANTHROPIC_API_KEY in the environment (see .env.example).
-Optional: COURSE_MODEL to override the model (default claude-sonnet-4-5).
+Configure via environment (see .env.example). Defaults target OpenRouter's
+free tier with a Qwen model. Also works with Groq or a local Ollama —
+anything OpenAI-compatible.
 """
 
 from .orchestrator import run_course

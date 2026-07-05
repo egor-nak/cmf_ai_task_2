@@ -16,9 +16,24 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
 import time
 import urllib.error
 import urllib.request
+
+
+def _make_ssl_context() -> ssl.SSLContext:
+    """macOS python.org builds often lack root CAs (CERTIFICATE_VERIFY_FAILED).
+    Prefer certifi's CA bundle when available; fall back to system default."""
+    try:
+        import certifi  # type: ignore
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
+_SSL_CTX = _make_ssl_context()
 
 BASE_URL = os.environ.get("COURSE_BASE_URL", "https://openrouter.ai/api/v1")
 API_KEY = (
@@ -49,7 +64,7 @@ def _chat_completion(messages: list[dict]) -> tuple[str, int]:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=180) as r:
+        with urllib.request.urlopen(req, timeout=180, context=_SSL_CTX) as r:
             data = json.loads(r.read())
     except urllib.error.HTTPError as e:
         return e.read().decode(errors="replace")[:500], e.code

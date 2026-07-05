@@ -43,6 +43,22 @@ API_KEY = (
     or "ollama"  # Ollama ignores the key; anything non-empty works
 )
 MODEL = os.environ.get("COURSE_MODEL", "openai/gpt-oss-120b:free")
+# Comma-separated fallbacks: free-tier models get saturated or lose :free status;
+# the runner rotates to the next model on repeated 429s or on 404.
+MODELS = [
+    m.strip()
+    for m in (MODEL + "," + os.environ.get("COURSE_FALLBACK_MODELS", "")).split(",")
+    if m.strip()
+]
+_active = {"idx": 0}  # shared by both agents so they stay on the same model
+
+
+def _rotate_model(reason: str) -> None:
+    if _active["idx"] + 1 < len(MODELS):
+        _active["idx"] += 1
+        print(f"[models] {reason} — switching to {MODELS[_active['idx']]}")
+    else:
+        print(f"[models] {reason} — no fallbacks left, staying on {MODELS[_active['idx']]}")
 MAX_TOKENS = int(os.environ.get("COURSE_MAX_TOKENS", "1200"))
 # Free tiers are rate-limited (OpenRouter free: ~20 req/min). Pause between calls.
 SLEEP_BETWEEN_CALLS = float(os.environ.get("COURSE_SLEEP", "3.5"))
@@ -56,7 +72,7 @@ def _chat_completion(messages: list[dict]) -> tuple[str, int]:
     req = urllib.request.Request(
         f"{BASE_URL.rstrip('/')}/chat/completions",
         data=json.dumps(
-            {"model": MODEL, "max_tokens": MAX_TOKENS, "messages": messages}
+            {"model": MODELS[_active["idx"]], "max_tokens": MAX_TOKENS, "messages": messages}
         ).encode(),
         headers={
             "Authorization": f"Bearer {API_KEY}",
@@ -93,18 +109,27 @@ class Agent:
         messages = [{"role": "system", "content": system}] + self.history
 
         text = ""
-        for attempt in range(6):
+        soft_fails = 0  # consecutive 429/5xx on the current model
+        for attempt in range(10):
             time.sleep(SLEEP_BETWEEN_CALLS)
             try:
                 text, status = _chat_completion(messages)
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 print(f"[{self.name}] network error ({e}), retrying...")
-                time.sleep(2**attempt * 5)
+                time.sleep(2**min(attempt, 4) * 5)
                 continue
             if status == 200 and text:
                 break
+            if status == 404:  # model lost :free status or was removed
+                _rotate_model(f"HTTP 404 for {MODELS[_active['idx']]}")
+                continue
             if status in (429, 500, 502, 503, 529):
-                wait = 2**attempt * 10 if status == 429 else 2**attempt * 5
+                soft_fails += 1
+                if soft_fails >= 2:  # saturated free pool — try the next model
+                    _rotate_model(f"repeated HTTP {status} on {MODELS[_active['idx']]}")
+                    soft_fails = 0
+                    continue
+                wait = 2**min(attempt, 3) * (10 if status == 429 else 5)
                 print(f"[{self.name}] HTTP {status}, waiting {wait}s... ({text[:120]})")
                 time.sleep(wait)
                 continue
@@ -112,7 +137,9 @@ class Agent:
                 continue  # empty completion: retry (flaky free endpoints)
             raise RuntimeError(f"{self.name}: HTTP {status}: {text[:300]}")
         if not text:
-            raise RuntimeError(f"{self.name}: no completion after retries (model={MODEL})")
+            raise RuntimeError(
+                f"{self.name}: no completion after retries (tried: {', '.join(MODELS[: _active['idx'] + 1])})"
+            )
 
         # Some free reasoning models emit <think>...</think>; strip it.
         if "<think>" in text and "</think>" in text:

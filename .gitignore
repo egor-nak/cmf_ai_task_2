@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .venv/
 transcripts/run-*
+GITHUB.md
+Отчёт_по_заданию.docx

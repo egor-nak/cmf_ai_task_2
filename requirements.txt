@@ -1,1 +1,2 @@
-openai>=1.40.0
+# No required dependencies — the runner uses Python's built-in urllib.
+# (Python 3.10+)

@@ -30,10 +30,10 @@ The runner speaks the OpenAI-compatible API, so it works with any of:
 | **Ollama** | 100% free, local | `ollama pull qwen3:8b`, no key needed |
 
 ```bash
-pip install -r requirements.txt
+# no pip install needed — zero dependencies, Python 3.10+ only
 cp .env.example .env        # pick provider + model, add key (see options inside)
 export $(grep -v '^#' .env | xargs)
-python -m src.run_course
+python3 -m src.run_course
 ```
 
 The full dialogue streams to stdout and is saved to `transcripts/run-<stamp>.md`

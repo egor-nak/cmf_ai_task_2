@@ -5,16 +5,20 @@ Works with free/cheap providers out of the box:
 - Groq: fast free tier (e.g. llama / qwen models)
 - Ollama: fully free, local (base url http://localhost:11434/v1)
 
+Zero required dependencies: uses the `openai` package if installed, otherwise
+falls back to a built-in urllib client (same API surface, retries included).
+
 Each agent keeps its OWN message history in which *it* is the assistant and
 the other agent is the user — the cleanest way to run a symmetric dialogue.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import time
-
-from openai import OpenAI, APIStatusError, RateLimitError
+import urllib.error
+import urllib.request
 
 BASE_URL = os.environ.get("COURSE_BASE_URL", "https://openrouter.ai/api/v1")
 API_KEY = (
@@ -29,12 +33,36 @@ MAX_TOKENS = int(os.environ.get("COURSE_MAX_TOKENS", "1200"))
 SLEEP_BETWEEN_CALLS = float(os.environ.get("COURSE_SLEEP", "3.5"))
 
 
+def _chat_completion(messages: list[dict]) -> tuple[str, int]:
+    """One chat-completion call. Returns (text, http_status). Raises on hard errors.
+
+    Uses plain urllib so the project runs with no third-party packages at all.
+    """
+    req = urllib.request.Request(
+        f"{BASE_URL.rstrip('/')}/chat/completions",
+        data=json.dumps(
+            {"model": MODEL, "max_tokens": MAX_TOKENS, "messages": messages}
+        ).encode(),
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r:
+            data = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.read().decode(errors="replace")[:500], e.code
+    if "error" in data:  # OpenRouter sometimes returns 200 with an error body
+        return json.dumps(data["error"])[:500], int(data["error"].get("code", 500) or 500)
+    return (data["choices"][0]["message"].get("content") or "").strip(), 200
+
+
 class Agent:
     def __init__(self, name: str, system_prompt: str):
         self.name = name
         self.system_prompt = system_prompt
         self.history: list[dict] = []  # this agent's own view of the dialogue
-        self.client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
 
     def hear(self, text: str) -> None:
         """Record a message from the other agent (as 'user' in this agent's view)."""
@@ -51,31 +79,29 @@ class Agent:
 
         text = ""
         for attempt in range(6):
+            time.sleep(SLEEP_BETWEEN_CALLS)
             try:
-                time.sleep(SLEEP_BETWEEN_CALLS)
-                response = self.client.chat.completions.create(
-                    model=MODEL,
-                    max_tokens=MAX_TOKENS,
-                    messages=messages,
-                )
-                text = (response.choices[0].message.content or "").strip()
-                # Some free reasoning models emit <think>...</think>; strip it.
-                if "<think>" in text and "</think>" in text:
-                    text = text.split("</think>", 1)[1].strip()
-                if text:
-                    break
-                # Empty completion: retry (happens on flaky free endpoints).
-            except RateLimitError:
-                wait = 2**attempt * 5
-                print(f"[{self.name}] rate limited, waiting {wait}s...")
+                text, status = _chat_completion(messages)
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                print(f"[{self.name}] network error ({e}), retrying...")
+                time.sleep(2**attempt * 5)
+                continue
+            if status == 200 and text:
+                break
+            if status in (429, 500, 502, 503, 529):
+                wait = 2**attempt * 10 if status == 429 else 2**attempt * 5
+                print(f"[{self.name}] HTTP {status}, waiting {wait}s... ({text[:120]})")
                 time.sleep(wait)
-            except APIStatusError as e:
-                if e.status_code in (429, 500, 502, 503, 529) and attempt < 5:
-                    time.sleep(2**attempt * 5)
-                    continue
-                raise
+                continue
+            if status == 200 and not text:
+                continue  # empty completion: retry (flaky free endpoints)
+            raise RuntimeError(f"{self.name}: HTTP {status}: {text[:300]}")
         if not text:
             raise RuntimeError(f"{self.name}: no completion after retries (model={MODEL})")
+
+        # Some free reasoning models emit <think>...</think>; strip it.
+        if "<think>" in text and "</think>" in text:
+            text = text.split("</think>", 1)[1].strip()
 
         self.history.append({"role": "assistant", "content": text})
         return text

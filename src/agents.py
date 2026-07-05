@@ -42,7 +42,7 @@ API_KEY = (
     or os.environ.get("OPENAI_API_KEY")
     or "ollama"  # Ollama ignores the key; anything non-empty works
 )
-MODEL = os.environ.get("COURSE_MODEL", "qwen/qwen3-14b:free")
+MODEL = os.environ.get("COURSE_MODEL", "openai/gpt-oss-120b:free")
 MAX_TOKENS = int(os.environ.get("COURSE_MAX_TOKENS", "1200"))
 # Free tiers are rate-limited (OpenRouter free: ~20 req/min). Pause between calls.
 SLEEP_BETWEEN_CALLS = float(os.environ.get("COURSE_SLEEP", "3.5"))

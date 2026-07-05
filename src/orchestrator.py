@@ -69,6 +69,21 @@ def run_course(out_dir: Path | None = None, resume: str | None = None) -> Path:
     mentor = Agent("Maya (mentor)", build_mentor_system())
     student = Agent("Denis (student)", load_text("prompts/student_system.md"))
 
+    lessons = {l["id"]: l for l in json.loads(load_text("course/curriculum.json"))["lessons"]}
+
+    def mentor_context() -> str:
+        """Memory block + the current lesson's full curriculum entry, re-injected
+        every turn so weak free models can't drift off-curriculum."""
+        block = memory.to_block()
+        lesson = lessons.get(memory.current_lesson)
+        if lesson:
+            block += (
+                "\n=== CURRENT LESSON (teach exactly this, no other) ===\n"
+                + json.dumps(lesson, ensure_ascii=False, indent=1)
+                + "\n=== END CURRENT LESSON ==="
+            )
+        return block
+
     transcript: list[dict] = []
 
     if resume:
@@ -106,7 +121,7 @@ def run_course(out_dir: Path | None = None, resume: str | None = None) -> Path:
         mentor.hear("(The student has joined the chat. Begin the course.)")
 
     for _ in range(MAX_TURN_PAIRS - len(transcript) // 2):
-        raw = mentor.speak(memory_block=memory.to_block())
+        raw = mentor.speak(memory_block=mentor_context())
         visible, update, parse_err = extract_memory_update(raw)
         visible = scrub_memory_blocks(visible)  # belt and braces: nothing leaks
 

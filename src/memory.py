@@ -18,7 +18,8 @@ from pathlib import Path
 
 VALID_STATUSES = {"unverified", "shaky", "verified", "caught-bluffing"}
 
-MEMORY_BLOCK_RE = re.compile(r"<memory>\s*(\{.*?\})\s*</memory>", re.DOTALL)
+# Tolerant closer: live runs showed models typo the closing tag (</message>).
+MEMORY_BLOCK_RE = re.compile(r"<memory>\s*(\{.*?\})\s*(?:</\w+>|$)", re.DOTALL)
 
 MEMORY_PROTOCOL = """
 ## Memory protocol (machine-read — follow exactly)
@@ -31,7 +32,20 @@ Rules:
 - Use "caught-bluffing" the moment you catch a fake practice claim.
 - You cannot advance to lesson N+1 unless lesson N is "verified" — the system will refuse and tell you.
 - The student never sees this block. Everything before it is your normal message.
+- The block is YOURS ALONE. Never mention it to the student, never ask the student to include one, and never quote it in your visible message.
 """
+
+
+def scrub_memory_blocks(text: str) -> str:
+    """Remove any memory-block-looking content from text. Used defensively on
+    everything the student sees and on the student's own output (live runs
+    showed models occasionally echoing the protocol)."""
+    text = MEMORY_BLOCK_RE.sub("", text)
+    # Unclosed opener: cut from '<memory>' to end of text.
+    idx = text.find("<memory>")
+    if idx != -1:
+        text = text[:idx]
+    return text.strip()
 
 
 @dataclass

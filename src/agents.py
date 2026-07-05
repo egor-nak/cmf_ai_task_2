@@ -59,7 +59,7 @@ def _rotate_model(reason: str) -> None:
         print(f"[models] {reason} — switching to {MODELS[_active['idx']]}")
     else:
         print(f"[models] {reason} — no fallbacks left, staying on {MODELS[_active['idx']]}")
-MAX_TOKENS = int(os.environ.get("COURSE_MAX_TOKENS", "1200"))
+MAX_TOKENS = int(os.environ.get("COURSE_MAX_TOKENS", "2400"))
 # Free tiers are rate-limited (OpenRouter free: ~20 req/min). Pause between calls.
 SLEEP_BETWEEN_CALLS = float(os.environ.get("COURSE_SLEEP", "3.5"))
 
@@ -120,6 +120,7 @@ class Agent:
                 continue
             if status == 200 and text:
                 break
+            err, text = text, ""  # NEVER let an error body leak into the dialogue
             if status == 404:  # model lost :free status or was removed
                 _rotate_model(f"HTTP 404 for {MODELS[_active['idx']]}")
                 continue
@@ -130,15 +131,17 @@ class Agent:
                     soft_fails = 0
                     continue
                 wait = 2**min(attempt, 3) * (10 if status == 429 else 5)
-                print(f"[{self.name}] HTTP {status}, waiting {wait}s... ({text[:120]})")
+                print(f"[{self.name}] HTTP {status}, waiting {wait}s... ({err[:120]})")
                 time.sleep(wait)
                 continue
-            if status == 200 and not text:
+            if status == 200:
                 continue  # empty completion: retry (flaky free endpoints)
-            raise RuntimeError(f"{self.name}: HTTP {status}: {text[:300]}")
+            raise RuntimeError(f"{self.name}: HTTP {status}: {err[:300]}")
         if not text:
             raise RuntimeError(
-                f"{self.name}: no completion after retries (tried: {', '.join(MODELS[: _active['idx'] + 1])})"
+                f"{self.name}: no completion after retries — quota likely exhausted "
+                f"(tried: {', '.join(MODELS[: _active['idx'] + 1])}). "
+                f"The run can be resumed later: python3 -m src.run_course --resume transcripts/run-<stamp>"
             )
 
         # Some free reasoning models emit <think>...</think>; strip it.

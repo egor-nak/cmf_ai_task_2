@@ -5,10 +5,22 @@ Loop shape:
     -> student speaks -> mentor hears -> repeat
 
 The mentor drives: it emits a <memory>{...}</memory> block each turn (see
-src/memory.py). The orchestrator enforces the advancement rule in code — an
-invalid advance or a malformed block produces a corrective note the mentor
-sees on its next turn. The loop ends when the mentor prints [COURSE_COMPLETE]
-after the final assessment, or when the turn budget runs out (safety valve).
+src/memory.py). The orchestrator enforces, in code, the things prompts alone
+can't guarantee on cheap models:
+
+- ADVANCEMENT: an invalid advance (lesson N not verified) is refused and the
+  error is fed back to the mentor.
+- PHASE: during onboarding the mentor gets an onboarding brief (what profile
+  facts are still missing) instead of lesson content — so the course cannot
+  open with a lecture.
+- BREVITY: if the mentor's visible message exceeds the word cap, it gets a
+  system nudge on its next turn (real users skim or quit).
+- SESSION CADENCE: when the mentor sets "end_session" after assigning
+  practice, the orchestrator inserts a next-day marker for both agents,
+  simulating the async rhythm of a real coaching app.
+
+The loop ends when the mentor prints [COURSE_COMPLETE] after the final
+assessment, or when the turn budget runs out (safety valve).
 """
 
 from __future__ import annotations
@@ -26,8 +38,19 @@ from .memory import (
 )
 
 ROOT = Path(__file__).resolve().parent.parent
-MAX_TURN_PAIRS = 140  # hard safety cap for the whole course
+MAX_TURN_PAIRS = 180  # hard safety cap: short-turn design needs more, smaller turns
 COMPLETE_MARK = "[COURSE_COMPLETE]"
+MENTOR_WORD_CAP = 90  # nudge threshold (style cap is ~50; 90 = clearly rambling)
+NEXT_DAY_MARK = "— next day —"
+
+ONBOARDING_BRIEF = """
+=== PHASE: ONBOARDING — DO NOT TEACH YET ===
+You are getting to know a brand-new student. Missing profile facts: {missing}.
+Ask ONE casual question per message; react like a human between questions.
+When you know their job, their goal, and one real task from their week, set
+{{"phase": "course"}} in your memory block and begin lesson 1 THROUGH that real
+task — as help, not as a lesson announcement.
+=== END PHASE ===""".rstrip()
 
 
 def load_text(rel: str) -> str:
@@ -35,15 +58,36 @@ def load_text(rel: str) -> str:
 
 
 def build_mentor_system() -> str:
+    # Lesson TITLES only — the current lesson's full entry is injected each
+    # turn by mentor_context(). Embedding the whole curriculum here would cost
+    # ~2.5K tokens on every call (free tiers cap tokens/day, not just requests).
     prompt = load_text("prompts/mentor_system.md")
-    curriculum = load_text("course/curriculum.json")
+    cur = json.loads(load_text("course/curriculum.json"))
+    titles = "\n".join(f"{l['id']}. {l['title']}" for l in cur["lessons"])
     return (
         f"{prompt}\n{MEMORY_PROTOCOL}\n"
-        f"## Curriculum (teach these lessons in order)\n"
-        f"```json\n{curriculum}\n```\n\n"
+        f"## Course: {cur['course_title']} — lessons in order\n{titles}\n\n"
+        f"(The current lesson's full entry — skill, practice, verification, "
+        f"red flags — is provided in context every turn.)\n\n"
         f"When the final assessment after lesson 10 is delivered, end your last "
         f"message (before the memory block) with the exact marker {COMPLETE_MARK}."
     )
+
+
+# Fragments that mean an agent leaked reasoning or protocol instead of
+# speaking in character. Deliberately specific: normal dialogue never
+# contains these strings.
+LEAK_MARKERS = (
+    "advance_to_lesson", "lesson_status", "<memory", "memory block",
+    "we need to respond", "we need to produce", "we need to output",
+    "the user message", "as maya", "as denis", "the assistant",
+    "system prompt", "our previous", "role-play",
+)
+
+
+def looks_leaky(text: str) -> bool:
+    low = text.lower()
+    return any(m in low for m in LEAK_MARKERS)
 
 
 def run_course(out_dir: Path | None = None, resume: str | None = None) -> Path:
@@ -66,15 +110,23 @@ def run_course(out_dir: Path | None = None, resume: str | None = None) -> Path:
     memory_path = out_dir / f"run-{stamp}-memory.json"
 
     memory = MentorMemory.load(memory_path) if resume else MentorMemory()
-    mentor = Agent("Maya (mentor)", build_mentor_system())
-    student = Agent("Denis (student)", load_text("prompts/student_system.md"))
+    # Per-agent token budgets: the student texts in fragments, the mentor in
+    # 1-3 sentences. Small budgets double as a brevity backstop and cost cap.
+    mentor = Agent("Maya (mentor)", build_mentor_system(), max_tokens=700)
+    student = Agent("Denis (student)", load_text("prompts/student_system.md"), max_tokens=350)
 
     lessons = {l["id"]: l for l in json.loads(load_text("course/curriculum.json"))["lessons"]}
 
     def mentor_context() -> str:
-        """Memory block + the current lesson's full curriculum entry, re-injected
-        every turn so weak free models can't drift off-curriculum."""
+        """Memory block + phase-appropriate brief, re-injected every turn so
+        weak free models can't drift off-curriculum (or into lecturing)."""
         block = memory.to_block()
+        if memory.phase == "onboarding":
+            missing = [k for k in ("job", "goal", "real_task") if k not in memory.user_profile]
+            block += "\n" + ONBOARDING_BRIEF.format(
+                missing=", ".join(missing) if missing else "none — switch phase to 'course' now"
+            )
+            return block
         lesson = lessons.get(memory.current_lesson)
         if lesson:
             block += (
@@ -98,6 +150,9 @@ def run_course(out_dir: Path | None = None, resume: str | None = None) -> Path:
             text = scrub_memory_blocks(e["text"])
             if not text:
                 continue
+            if e["speaker"] == "⏱":  # next-day marker, not a dialogue turn
+                transcript.append(e)
+                continue
             if e["speaker"].startswith("Maya"):
                 mentor.history.append({"role": "assistant", "content": text})
                 student.hear(text)
@@ -116,17 +171,38 @@ def run_course(out_dir: Path | None = None, resume: str | None = None) -> Path:
             f.write(json.dumps(transcript[-1], ensure_ascii=False) + "\n")
         print(f"\n----- {speaker} (lesson {memory.current_lesson}) -----\n{text}")
 
-    # Kick off: the mentor opens the course.
+    # Kick off: a new student appears; the mentor says hi (no teaching yet —
+    # the onboarding brief in mentor_context() enforces that).
     if not resume:
-        mentor.hear("(The student has joined the chat. Begin the course.)")
+        mentor.hear("(A new student has just joined the chat. Say hi.)")
+
+    pending_day_break = False  # set when the previous mentor turn ended a session
 
     for _ in range(MAX_TURN_PAIRS - len(transcript) // 2):
-        raw = mentor.speak(memory_block=mentor_context())
-        visible, update, parse_err = extract_memory_update(raw)
-        visible = scrub_memory_blocks(visible)  # belt and braces: nothing leaks
+        # --- Mentor turn, validated BEFORE the student sees anything. ---
+        # A bad turn (leaked reasoning/protocol, missing memory block, empty
+        # text) is erased from the mentor's own history and regenerated with a
+        # corrective note — the one-turn-too-late feedback of v1 let a single
+        # malformed message contaminate the whole dialogue.
+        visible, update, parse_err = "", None, None
+        for _attempt in range(3):
+            raw = mentor.speak(memory_block=mentor_context())
+            visible, update, parse_err = extract_memory_update(raw)
+            visible = scrub_memory_blocks(visible)  # belt and braces: nothing leaks
+            if visible and update is not None and not looks_leaky(visible):
+                break
+            mentor.history.pop()  # erase the bad attempt
+            mentor.hear(
+                "(SYSTEM: your last output was invalid — it leaked internal "
+                "reasoning/protocol text, or lacked the <memory> block. Send it "
+                "again properly: a short in-character chat message to the student, "
+                "then the <memory>{...}</memory> block on its own line. Nothing else.)"
+            )
 
         system_note = ""
+        end_session = False
         if update is not None:
+            end_session = bool(update.get("end_session"))
             result = memory.apply_update(update)
             memory.save(memory_path)
             if result.startswith("error"):
@@ -134,16 +210,46 @@ def run_course(out_dir: Path | None = None, resume: str | None = None) -> Path:
         elif parse_err:
             system_note = f"(SYSTEM: {parse_err} — re-read the memory protocol and include the block next turn)"
 
+        if not visible:  # all retries failed — keep the dialogue alive
+            visible = "sorry, one sec — hit send too early."
+
+        # Brevity guard: prompts ask for ~50 words; cheap models drift. Nudge.
+        wc = len(visible.split())
+        if wc > MENTOR_WORD_CAP:
+            system_note += (
+                f" (SYSTEM: your last message was {wc} words — the cap is ~50. "
+                f"Real users skim or quit. One idea, one question, shorter.)"
+            )
+
         record("Maya (mentor)", visible)
         if COMPLETE_MARK in visible:
             break
-        student.hear(visible.replace(COMPLETE_MARK, "").strip())
+        student_hears = visible.replace(COMPLETE_MARK, "").strip()
+        if pending_day_break:
+            student_hears = "(It is now the next day.)\n\n" + student_hears
+            pending_day_break = False
+        student.hear(student_hears)
 
-        # Scrub the student's output too: live runs showed models echoing the
-        # protocol after glimpsing a malformed block.
-        student_text = scrub_memory_blocks(student.speak())
+        # --- Student turn, validated the same way: scrub, detect leaks, retry.
+        student_text = ""
+        for _attempt in range(3):
+            student_text = scrub_memory_blocks(student.speak())
+            if student_text and not looks_leaky(student_text):
+                break
+            student.history.pop()  # erase the bad attempt
+            student.hear(
+                "(SYSTEM: invalid output — you are Denis texting his coach. "
+                "Reply again with ONLY Denis's next short casual message. "
+                "No JSON, no protocol text, no analysis of the conversation.)"
+            )
         record("Denis (student)", student_text)
-        heard = student_text if not system_note else f"{system_note}\n\n{student_text}"
+        heard = student_text if not system_note.strip() else f"{system_note.strip()}\n\n{student_text}"
+        if end_session:
+            # Simulate the async coaching cadence: practice happens off-screen
+            # overnight; both agents get a time marker.
+            record("⏱", NEXT_DAY_MARK)
+            heard += "\n\n(-- Session over. It is now the next day; the student is back. --)"
+            pending_day_break = True
         mentor.hear(heard)
 
     # Write the markdown transcript.

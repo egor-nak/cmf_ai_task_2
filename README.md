@@ -5,17 +5,29 @@ Multi-agent simulation for the AI School assignment: a **mentor** agent teaches 
 having done the practice. The mentor must detect bluffing and refuse to advance
 until it has real evidence of application — using conversation alone.
 
+**v2 — conversation-first redesign.** Both agents now text like humans (mentor
+≤ ~50 words, student 5–25), the course opens with onboarding instead of a
+lecture (enforced by a phase machine, not just the prompt), lessons are taught
+through the student's own real task, and homework triggers a simulated
+next-day session break. See `SUBMISSION.md` §5 for the full rationale.
+
+**Final submitted run:** `transcripts/final_run.md` — 94 turn pairs, all ten
+lessons verified, run live on **deepseek-v4-flash** via an OpenAI-compatible
+API. (`transcripts/design_walkthrough.md` is the authored reference dialogue
+the prompts were designed toward.)
+
 ## Repo layout
 
 ```
 prompts/mentor_system.md    Mentor persona + verification doctrine + bluff protocol
 prompts/student_system.md   Student persona + unreliability rule
 course/curriculum.json      10 lessons, each with skill, practice, verification questions, red flags
-src/agents.py               Anthropic API agent wrapper (each agent keeps its own history)
+src/agents.py               OpenAI-compatible agent wrapper (each agent keeps its own history)
 src/memory.py               Mentor memory tool — enforces "no advance without verified" in code
 src/orchestrator.py         Turn-by-turn loop, transcript capture (md + jsonl)
 src/run_course.py           Entry point
-transcripts/                Captured runs
+transcripts/final_run.md    The submitted live run (deepseek-v4-flash)
+transcripts/                Other captured runs (gitignored)
 SUBMISSION.md               The single submission document (all 5 required sections)
 ```
 
@@ -25,25 +37,27 @@ The runner speaks the OpenAI-compatible API, so it works with any of:
 
 | Provider | Cost | Setup |
 |---|---|---|
-| **OpenRouter** (default) | free tier | key from https://openrouter.ai; pick a current `:free` model at https://openrouter.ai/collections/free-models |
-| **Groq** | free tier, fast | key from https://console.groq.com |
+| **Qwen / Alibaba Model Studio** | trial token quota, then cents | key from https://modelstudio.console.alibabacloud.com; model `qwen-plus` (runner auto-sends `enable_thinking=false`) |
+| **Groq** | free tier, fast | key from https://console.groq.com; `llama-3.3-70b-versatile` (~1,000 req/day) |
+| **OpenRouter** | free tier (~50 req/day) | key from https://openrouter.ai; pick a current `:free` model at https://openrouter.ai/collections/free-models |
 | **Ollama** | 100% free, local | `ollama pull qwen3:8b`, no key needed |
 
 ```bash
 # no pip install needed — zero dependencies, Python 3.10+ only
-cp .env.example .env        # pick provider + model, add key (see options inside)
-export $(grep -v '^#' .env | xargs)
-python3 -m src.run_course
+cp .env.example .env        # pick provider + model, add your real key inside
+python3 -m src.run_course   # .env is loaded automatically — no export/source step
 ```
 
 The full dialogue streams to stdout and is saved to `transcripts/run-<stamp>.md`
 (plus a `.jsonl` and the mentor's final memory state).
 
-**Free-tier notes:** OpenRouter free models are rate-limited (~20 req/min,
-200 req/day) — `COURSE_SLEEP` throttles calls to fit. A full course run is
-roughly 100–200 API calls, so it fits in one day's free quota, barely; Ollama
-has no limits at all. Free model IDs change without warning — verify yours
-exists before a long run.
+**Free-tier notes:** OpenRouter free models are rate-limited (~20 req/min;
+~50 free-model requests/day, or ~1,000/day after a one-time $10 credit
+purchase) — `COURSE_SLEEP` throttles calls to fit the per-minute cap. The
+short-turn design needs roughly 230–280 API calls per full run, so either buy
+the $10 unlock, use Groq, run locally on Ollama (no limits), or split the run
+across days with `--resume`. Free model IDs change without warning — verify
+yours exists before a long run.
 
 ## Design notes (short version — full rationale in SUBMISSION.md)
 

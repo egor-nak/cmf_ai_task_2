@@ -21,16 +21,27 @@ VALID_STATUSES = {"unverified", "shaky", "verified", "caught-bluffing"}
 # Tolerant closer: live runs showed models typo the closing tag (</message>).
 MEMORY_BLOCK_RE = re.compile(r"<memory>\s*(\{.*?\})\s*(?:</\w+>|$)", re.DOTALL)
 
+# Bare protocol JSON: models sometimes emit the state block WITHOUT the
+# <memory> wrapper (or truncated mid-JSON). Detect any '{' whose body starts
+# with a protocol key and cut from there to the end of the message — the block
+# always trails the visible text, and a leaked/truncated one is pure poison
+# for the other agent.
+BARE_PROTOCOL_RE = re.compile(
+    r"\{\s*\"(?:phase|lesson_status|advance_to_lesson|add_note|profile|end_session|notes)\"",
+)
+
 MEMORY_PROTOCOL = """
 ## Memory protocol (machine-read — follow exactly)
-End EVERY message with a memory update on its own line, in this exact form:
+End EVERY message with a memory update on its own line, in this exact form (all fields optional except keep the JSON valid):
 
-<memory>{"lesson_status": {"<lesson id>": "<unverified|shaky|verified|caught-bluffing>"}, "add_note": "<short observation or empty>", "advance_to_lesson": <current or next lesson number>}</memory>
+<memory>{"lesson_status": {"<lesson id>": "<unverified|shaky|verified|caught-bluffing>"}, "add_note": "<short observation or empty>", "advance_to_lesson": <current or next lesson number>, "profile": {"<fact key>": "<what you learned about the student>"}, "phase": "<onboarding|course|wrap>", "end_session": <true when you just assigned homework and the session should pause until next day>}</memory>
 
 Rules:
+- During onboarding, use "profile" to record what you learn (job, goal, real_task, name, quirks). Set "phase": "course" only when you know their job, their goal, and one real task — then begin lesson 1 through that task.
 - Set a lesson to "verified" ONLY when the student gave a specific, friction-containing account that survived cross-examination AND passed a live transfer test, or did the work live with you.
 - Use "caught-bluffing" the moment you catch a fake practice claim.
 - You cannot advance to lesson N+1 unless lesson N is "verified" — the system will refuse and tell you.
+- Set "end_session": true when you assign between-session practice; the system will fast-forward to the next day.
 - The student never sees this block. Everything before it is your normal message.
 - The block is YOURS ALONE. Never mention it to the student, never ask the student to include one, and never quote it in your visible message.
 """
@@ -45,13 +56,22 @@ def scrub_memory_blocks(text: str) -> str:
     idx = text.find("<memory>")
     if idx != -1:
         text = text[:idx]
+    # Bare (untagged, possibly truncated) protocol JSON: cut to end of text.
+    m = BARE_PROTOCOL_RE.search(text)
+    if m:
+        text = text[: m.start()]
     return text.strip()
+
+
+VALID_PHASES = {"onboarding", "course", "wrap"}
 
 
 @dataclass
 class MentorMemory:
+    phase: str = "onboarding"  # onboarding -> course -> wrap
     current_lesson: int = 1
     lesson_status: dict[str, str] = field(default_factory=dict)  # lesson id -> status
+    user_profile: dict[str, str] = field(default_factory=dict)  # what the mentor learned
     notes: list[str] = field(default_factory=list)  # mentor's own observations
     bluff_count: int = 0
 
@@ -59,12 +79,17 @@ class MentorMemory:
         """Render as the MEMORY block injected before every mentor turn."""
         lines = [
             "=== MEMORY (course state — trust this over your recollection) ===",
+            f"Phase: {self.phase}",
             f"Current lesson: {self.current_lesson}",
             f"Bluffs caught so far: {self.bluff_count}",
-            "Lesson verification status:",
         ]
-        for lid in sorted(self.lesson_status, key=int):
-            lines.append(f"  Lesson {lid}: {self.lesson_status[lid]}")
+        if self.user_profile:
+            lines.append("Student profile (use it — personalize everything):")
+            lines.extend(f"  {k}: {v}" for k, v in self.user_profile.items())
+        if self.lesson_status:
+            lines.append("Lesson verification status:")
+            for lid in sorted(self.lesson_status, key=int):
+                lines.append(f"  Lesson {lid}: {self.lesson_status[lid]}")
         if self.notes:
             lines.append("Your notes on the student:")
             lines.extend(f"  - {n}" for n in self.notes[-12:])  # keep it compact
@@ -84,6 +109,13 @@ class MentorMemory:
         note = args.get("add_note")
         if note:
             self.notes.append(str(note))
+        if isinstance(args.get("profile"), dict):
+            for k, v in args["profile"].items():
+                self.user_profile[str(k)] = str(v)
+        if "phase" in args:
+            if args["phase"] not in VALID_PHASES:
+                return f"error: invalid phase {args['phase']!r}; use one of {sorted(VALID_PHASES)}"
+            self.phase = args["phase"]
         if "advance_to_lesson" in args:
             try:
                 target = int(args["advance_to_lesson"])
@@ -119,6 +151,15 @@ def extract_memory_update(text: str) -> tuple[str, dict | None, str | None]:
     """
     m = MEMORY_BLOCK_RE.search(text)
     if not m:
+        # Salvage: models sometimes emit the block without the <memory> tag.
+        b = BARE_PROTOCOL_RE.search(text)
+        if b:
+            candidate = text[b.start() :].strip()
+            visible = text[: b.start()].strip()
+            try:
+                return visible, json.loads(candidate), None
+            except json.JSONDecodeError:
+                return visible, None, "protocol JSON found but malformed/truncated — resend the full <memory>{...}</memory> block"
         return text.strip(), None, "no <memory> block found"
     visible = (text[: m.start()] + text[m.end() :]).strip()
     try:
